@@ -1,50 +1,21 @@
 package com.schibsted.spain.retroswagger.lib
 
-import com.google.gson.annotations.SerializedName
-import com.squareup.kotlinpoet.AnnotationSpec
-import com.squareup.kotlinpoet.ClassName
-import com.squareup.kotlinpoet.FunSpec
-import com.squareup.kotlinpoet.KModifier
-import com.squareup.kotlinpoet.ParameterSpec
+import com.squareup.kotlinpoet.*
 import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
-import com.squareup.kotlinpoet.PropertySpec
-import com.squareup.kotlinpoet.TypeName
-import com.squareup.kotlinpoet.TypeSpec
-import com.squareup.kotlinpoet.TypeVariableName
-import com.squareup.kotlinpoet.asClassName
-import io.reactivex.Completable
-import io.reactivex.Single
-import io.swagger.models.HttpMethod
-import io.swagger.models.ModelImpl
-import io.swagger.models.Operation
-import io.swagger.models.RefModel
-import io.swagger.models.ArrayModel
-import io.swagger.models.Swagger
+import com.squareup.moshi.JsonClass
+import io.swagger.models.*
 import io.swagger.models.parameters.BodyParameter
 import io.swagger.models.parameters.Parameter
 import io.swagger.models.parameters.PathParameter
 import io.swagger.models.parameters.QueryParameter
-import io.swagger.models.properties.ArrayProperty
-import io.swagger.models.properties.DoubleProperty
-import io.swagger.models.properties.FloatProperty
-import io.swagger.models.properties.IntegerProperty
-import io.swagger.models.properties.LongProperty
-import io.swagger.models.properties.Property
-import io.swagger.models.properties.RefProperty
-import io.swagger.models.properties.StringProperty
+import io.swagger.models.properties.*
 import io.swagger.parser.SwaggerParser
-import retrofit2.http.Body
-import retrofit2.http.DELETE
-import retrofit2.http.GET
-import retrofit2.http.PATCH
-import retrofit2.http.POST
-import retrofit2.http.PUT
+import kotlinx.coroutines.Deferred
+import retrofit2.http.*
 import retrofit2.http.Path
-import retrofit2.http.Query
 import java.io.FileNotFoundException
-import java.lang.IllegalStateException
 import java.net.UnknownHostException
-import java.util.ArrayList
+import kotlin.reflect.KClass
 
 class RetroswaggerApiBuilder(
     private val retroswaggerApiConfiguration: RetroswaggerApiConfiguration,
@@ -61,11 +32,7 @@ class RetroswaggerApiBuilder(
     }
 
     private val swaggerModel: Swagger = try {
-        if (!retroswaggerApiConfiguration.swaggerUrl.isEmpty()) {
-            SwaggerParser().read(retroswaggerApiConfiguration.swaggerUrl)
-        } else {
-            SwaggerParser().read(retroswaggerApiConfiguration.swaggerFile)
-        }
+        SwaggerParser().read(retroswaggerApiConfiguration.swaggerFile)
     } catch (unknown: UnknownHostException) {
         errorTracking.logException(unknown)
         Swagger()
@@ -103,6 +70,35 @@ class RetroswaggerApiBuilder(
         addModelEnums()
     }
 
+    private fun createEnumClass(modelClass: KClass<*>, className: String, enumList: List<Pair<String, *>>): TypeSpec {
+        val companionBuilder = TypeSpec.companionObjectBuilder()
+
+        enumList.forEach {
+            when (modelClass) {
+                String::class -> PropertySpec.builder(it.first, String::class).initializer("%S", it.second).build()
+                Int::class -> PropertySpec.builder(it.first, Int::class).initializer("%L", it.second).build()
+                else -> null
+            }?.run { companionBuilder.addProperty(this) }
+        }
+
+        return TypeSpec.classBuilder(className)
+            .addType(companionBuilder.build())
+            .build()
+    }
+
+    private fun getModelClass(type: String) = when (type) {
+        INTEGER_SWAGGER_TYPE -> Int::class
+        else -> String::class
+    }
+
+    private fun parseEnumValues(type: String, enumValues: List<String>): List<*> = when (type) {
+        INTEGER_SWAGGER_TYPE -> {
+            enumValues.map { it.toInt() }
+        }
+
+        else -> enumValues
+    }
+
     private fun addModelEnums() {
         if (swaggerModel.definitions != null && !swaggerModel.definitions.isEmpty()) {
             for (definition in swaggerModel.definitions) {
@@ -118,6 +114,35 @@ class RetroswaggerApiBuilder(
                                 if (!enumListTypeSpec.contains(enumTypeSpecBuilder.build())) {
                                     enumListTypeSpec.add(enumTypeSpecBuilder.build())
                                 }
+                            }
+                        } else if (modelProperty.value is RefProperty) {
+                            try {
+                                val simpleRef = (modelProperty.value as RefProperty).simpleRef
+
+                                // If it's already in, move on
+                                if (enumListTypeSpec.any { it.name == simpleRef })
+                                    continue
+
+                                val modelDefinition = swaggerModel.definitions[simpleRef] as? ModelImpl
+
+                                if (modelDefinition != null && modelDefinition.enum != null) {
+                                    val modelClass = getModelClass(modelDefinition.type)
+
+                                    val enumClass = if (modelDefinition.vendorExtensions != null) {
+                                        @Suppress("UNCHECKED_CAST")
+                                        val names = modelDefinition.vendorExtensions["x-enumNames"] as ArrayList<String>
+                                        val zipped =
+                                            names.zip(parseEnumValues(modelDefinition.type, modelDefinition.enum))
+
+                                        createEnumClass(modelClass, simpleRef, zipped)
+                                    } else {
+                                        null
+                                    }
+
+                                    enumClass?.let { enumListTypeSpec.add(it) }
+                                }
+                            } catch (e: Exception) {
+                                // Ignore
                             }
                         }
                     }
@@ -168,27 +193,46 @@ class RetroswaggerApiBuilder(
                     classNameList.add("Model" + definition.key.capitalize())
                 }
 
-                if (definition.value != null && definition.value.properties != null) {
-                    val primaryConstructor = FunSpec.constructorBuilder()
-                    for (modelProperty in definition.value.properties) {
-                        val typeName: TypeName = getTypeName(modelProperty)
-                        val propertySpec = PropertySpec.builder(modelProperty.key, typeName)
-                            .addAnnotation(AnnotationSpec.builder(SerializedName::class)
-                                .addMember("\"${modelProperty.key}\"")
-                                .build())
-                            .initializer(modelProperty.key)
-                            .build()
-                        primaryConstructor.addParameter(modelProperty.key, typeName)
-                        modelClassTypeSpec.addProperty(propertySpec)
-                    }
-                    modelClassTypeSpec.primaryConstructor(primaryConstructor.build())
+                modelClassTypeSpec.addAnnotation(
+                    AnnotationSpec.builder(JsonClass::class)
+                        .addMember("generateAdapter = %L", true)
+                        .build()
+                )
 
-                    responseBodyModelListTypeSpec.add(modelClassTypeSpec.build())
+                val primaryConstructor = FunSpec.constructorBuilder()
+
+                val model = definition.value
+
+                if (model is ComposedModel) {
+                    model.allOf.forEach { addModelProperties(it, primaryConstructor, modelClassTypeSpec) }
+                } else {
+                    addModelProperties(model, primaryConstructor, modelClassTypeSpec)
                 }
+
+                modelClassTypeSpec.primaryConstructor(primaryConstructor.build())
+
+                responseBodyModelListTypeSpec.add(modelClassTypeSpec.build())
             }
         }
 
         return classNameList
+    }
+
+    private fun addModelProperties(
+        model: Model,
+        primaryConstructor: FunSpec.Builder,
+        modelClassTypeSpec: TypeSpec.Builder
+    ) {
+        if (model.properties != null) {
+            for (modelProperty in model.properties) {
+                val typeName: TypeName = getTypeName(modelProperty, swaggerModel.definitions)
+                val propertySpec = PropertySpec.builder(modelProperty.key, typeName)
+                    .initializer(modelProperty.key)
+                    .build()
+                primaryConstructor.addParameter(modelProperty.key, typeName)
+                modelClassTypeSpec.addProperty(propertySpec)
+            }
+        }
     }
 
     private fun createApiRetrofitInterface(classNameList: List<String>): TypeSpec {
@@ -206,64 +250,54 @@ class RetroswaggerApiBuilder(
             for (path in swaggerModel.paths) {
                 for (operation in path.value.operationMap) {
 
-                    var annotationSpec: AnnotationSpec
-                    if (retroswaggerApiConfiguration.overrideInterfaceSlash) {
-                        annotationSpec = when {
-                            operation.key.name.contains(
-                                "GET") -> AnnotationSpec.builder(GET::class)
-                                .addMember("\"${path.key.removePrefix("/")}\"").build()
-                            operation.key.name.contains(
-                                "POST") -> AnnotationSpec.builder(POST::class)
-                                .addMember("\"${path.key.removePrefix("/")}\"").build()
-                            operation.key.name.contains(
-                                "PUT") -> AnnotationSpec.builder(PUT::class)
-                                .addMember("\"${path.key.removePrefix("/")}\"").build()
-                            operation.key.name.contains(
-                                "PATCH") -> AnnotationSpec.builder(PATCH::class)
-                                .addMember("\"${path.key.removePrefix("/")}\"").build()
-                            operation.key.name.contains(
-                                "DELETE") -> AnnotationSpec.builder(DELETE::class)
-                                .addMember("\"${path.key.removePrefix("/")}\"").build()
-                            else -> AnnotationSpec.builder(GET::class)
-                                .addMember("\"${path.key.removePrefix("/")}\"").build()
-                        }
-                    } else {
-                        annotationSpec = when {
-                            operation.key.name.contains(
-                                "GET") -> AnnotationSpec.builder(GET::class)
-                                .addMember("\"${path.key}\"").build()
-                            operation.key.name.contains(
-                                "POST") -> AnnotationSpec.builder(POST::class)
-                                .addMember("\"${path.key}\"").build()
-                            operation.key.name.contains(
-                                "PUT") -> AnnotationSpec.builder(PUT::class)
-                                .addMember("\"${path.key}\"").build()
-                            operation.key.name.contains(
-                                "PATCH") -> AnnotationSpec.builder(PATCH::class)
-                                .addMember("\"${path.key}\"").build()
-                            operation.key.name.contains(
-                                "DELETE") -> AnnotationSpec.builder(DELETE::class)
-                                .addMember("\"${path.key}\"").build()
-                            else -> AnnotationSpec.builder(GET::class)
-                                .addMember("\"${path.key}\"").build()
-                        }
+                    val annotationSpec = when {
+                        operation.key.name.contains(
+                            "GET"
+                        ) -> AnnotationSpec.builder(GET::class)
+                            .addMember("\"${path.key.removePrefix("/")}\"").build()
+                        operation.key.name.contains(
+                            "POST"
+                        ) -> AnnotationSpec.builder(POST::class)
+                            .addMember("\"${path.key.removePrefix("/")}\"").build()
+                        operation.key.name.contains(
+                            "PUT"
+                        ) -> AnnotationSpec.builder(PUT::class)
+                            .addMember("\"${path.key.removePrefix("/")}\"").build()
+                        operation.key.name.contains(
+                            "PATCH"
+                        ) -> AnnotationSpec.builder(PATCH::class)
+                            .addMember("\"${path.key.removePrefix("/")}\"").build()
+                        operation.key.name.contains(
+                            "DELETE"
+                        ) -> AnnotationSpec.builder(DELETE::class)
+                            .addMember("\"${path.key.removePrefix("/")}\"").build()
+                        else -> AnnotationSpec.builder(GET::class)
+                            .addMember("\"${path.key.removePrefix("/")}\"").build()
                     }
 
                     try {
-                        val doc = ((listOf(operation.value.summary + "\n") +
-                                getMethodParametersDocs(operation)).joinToString("\n")).trim()
-
                         val returnedClass = getReturnedClass(operation, classNameList)
                         val methodParameters = getMethodParameters(operation)
-                        val funSpec = FunSpec.builder(operation.value.operationId)
+                        val operationName = operation.value.operationId
+
+                        val funSpecBuilder = FunSpec.builder(operationName)
                             .addModifiers(KModifier.PUBLIC, KModifier.ABSTRACT)
                             .addAnnotation(annotationSpec)
                             .addParameters(methodParameters)
                             .returns(returnedClass)
-                            .addKdoc("$doc\n")
-                            .build()
 
-                        apiInterfaceTypeSpec.addFunction(funSpec)
+                        val header = retroswaggerApiConfiguration.headers[operationName]
+
+                        header?.also {
+                            val headerAnnotationSpec = AnnotationSpec.builder(Headers::class)
+                                .also { builder ->
+                                    it.forEach { h -> builder.addMember("%S", h) }
+                                }.build()
+
+                            funSpecBuilder.addAnnotation(headerAnnotationSpec)
+                        }
+
+                        apiInterfaceTypeSpec.addFunction(funSpecBuilder.build())
                     } catch (exception: Exception) {
                         errorTracking.logException(exception)
                     }
@@ -272,16 +306,24 @@ class RetroswaggerApiBuilder(
         }
     }
 
-    private fun getMethodParametersDocs(operation: MutableMap.MutableEntry<HttpMethod, Operation>): Iterable<String> {
-        return operation.value.parameters.filterNot { it.description.isNullOrBlank() }
-            .map { "@param ${it.name} ${it.description}" }
-    }
-
-    private fun getTypeName(modelProperty: MutableMap.MutableEntry<String, Property>): TypeName {
+    private fun getTypeName(
+        modelProperty: MutableMap.MutableEntry<String, Property>,
+        definitions: MutableMap<String, Model>
+    ): TypeName {
         val property = modelProperty.value
         return when {
-            property.type == REF_SWAGGER_TYPE ->
-                TypeVariableName.invoke((property as RefProperty).simpleRef).requiredOrNullable(property.required)
+            property.type == REF_SWAGGER_TYPE -> {
+                val simpleRef = (property as RefProperty).simpleRef
+
+                if (enumListTypeSpec.any { it.name == simpleRef }) {
+
+                    val refModel = definitions[simpleRef] as ModelImpl
+
+                    getKotlinClassTypeName(refModel.type, refModel.format).requiredOrNullable(property.required)
+                } else {
+                    TypeVariableName.invoke(simpleRef).requiredOrNullable(property.required)
+                }
+            }
 
             property.type == ARRAY_SWAGGER_TYPE -> {
                 val arrayProperty = property as ArrayProperty
@@ -296,25 +338,36 @@ class RetroswaggerApiBuilder(
     ): Iterable<ParameterSpec> {
         return operation.value.parameters.mapNotNull { parameter ->
             // Transform parameters in the format foo.bar to fooBar
-            val name = parameter.name.split('.').mapIndexed { index, s -> if (index > 0) s.capitalize() else s }.joinToString("")
+            val name = parameter.name.split('.').mapIndexed { index, s -> if (index > 0) s.capitalize() else s }
+                .joinToString("")
             when (parameter.`in`) {
                 "body" -> {
                     ParameterSpec.builder(name, getBodyParameterSpec(parameter))
                         .addAnnotation(AnnotationSpec.builder(Body::class).build()).build()
                 }
                 "path" -> {
-                    val type = getKotlinClassTypeName((parameter as PathParameter).type, parameter.format).requiredOrNullable(parameter.required)
+                    val type =
+                        getKotlinClassTypeName((parameter as PathParameter).type, parameter.format).requiredOrNullable(
+                            parameter.required
+                        )
                     ParameterSpec.builder(name, type)
-                        .addAnnotation(AnnotationSpec.builder(Path::class).addMember("\"${parameter.name}\"").build()).build()
+                        .addAnnotation(AnnotationSpec.builder(Path::class).addMember("\"${parameter.name}\"").build())
+                        .build()
                 }
                 "query" -> {
                     if ((parameter as QueryParameter).type == ARRAY_SWAGGER_TYPE) {
-                        val type = List::class.asClassName().parameterizedBy(getKotlinClassTypeName(parameter.items.type)).requiredOrNullable(parameter.required)
+                        val type =
+                            List::class.asClassName().parameterizedBy(getKotlinClassTypeName(parameter.items.type))
+                                .requiredOrNullable(parameter.required)
                         ParameterSpec.builder(name, type)
                     } else {
-                        val type = getKotlinClassTypeName(parameter.type, parameter.format).requiredOrNullable(parameter.required)
+                        val type = getKotlinClassTypeName(
+                            parameter.type,
+                            parameter.format
+                        ).requiredOrNullable(parameter.required)
                         ParameterSpec.builder(name, type)
-                    }.addAnnotation(AnnotationSpec.builder(Query::class).addMember("\"${parameter.name}\"").build()).build()
+                    }.addAnnotation(AnnotationSpec.builder(Query::class).addMember("\"${parameter.name}\"").build())
+                        .build()
                 }
                 else -> null
             }
@@ -333,10 +386,10 @@ class RetroswaggerApiBuilder(
             else -> {
                 val bodyParameter1 = parameter.schema as? ModelImpl ?: ModelImpl()
 
-                if (STRING_SWAGGER_TYPE == bodyParameter1.type) {
-                    String::class.asClassName().requiredOrNullable(parameter.required)
-                } else {
-                    ClassName.bestGuess(parameter.name.capitalize()).requiredOrNullable(parameter.required)
+                when (bodyParameter1.type) {
+                    STRING_SWAGGER_TYPE -> String::class.asClassName().requiredOrNullable(parameter.required)
+                    BOOLEAN_SWAGGER_TYPE -> Boolean::class.asClassName().requiredOrNullable(parameter.required)
+                    else -> ClassName.bestGuess(parameter.name.capitalize()).requiredOrNullable(parameter.required)
                 }
             }
         }
@@ -362,22 +415,24 @@ class RetroswaggerApiBuilder(
     ): TypeName {
         try {
             if (operation.value.responses[OK_RESPONSE]?.schema != null &&
-                operation.value.responses[OK_RESPONSE]?.schema is RefProperty) {
+                operation.value.responses[OK_RESPONSE]?.schema is RefProperty
+            ) {
                 val refProperty = (operation.value.responses[OK_RESPONSE]?.schema as RefProperty)
                 var responseClassName = refProperty.simpleRef
                 responseClassName = getValidClassName(responseClassName, refProperty)
 
                 if (classNameList.contains(responseClassName)) {
-                    return Single::class.asClassName().parameterizedBy(TypeVariableName.invoke(responseClassName))
+                    return Deferred::class.asClassName().parameterizedBy(TypeVariableName.invoke(responseClassName))
                 }
             } else if (operation.value.responses[OK_RESPONSE]?.schema != null &&
-                operation.value.responses[OK_RESPONSE]?.schema is ArrayProperty) {
+                operation.value.responses[OK_RESPONSE]?.schema is ArrayProperty
+            ) {
                 val refProperty = (operation.value.responses[OK_RESPONSE]?.schema as ArrayProperty)
                 var responseClassName = (refProperty.items as RefProperty).simpleRef
                 responseClassName = getValidClassName(responseClassName, (refProperty.items as RefProperty))
 
                 if (classNameList.contains(responseClassName)) {
-                    return Single::class.asClassName().parameterizedBy(
+                    return Deferred::class.asClassName().parameterizedBy(
                         List::class.asClassName().parameterizedBy(TypeVariableName.invoke(responseClassName))
                     )
                 }
@@ -386,7 +441,9 @@ class RetroswaggerApiBuilder(
             errorTracking.logException(error)
         }
 
-        return Completable::class.asClassName()
+        return Deferred::class.asClassName().parameterizedBy(
+            Unit::class.asClassName()
+        )
     }
 
     private fun getValidClassName(responseClassName: String, refProperty: RefProperty): String {

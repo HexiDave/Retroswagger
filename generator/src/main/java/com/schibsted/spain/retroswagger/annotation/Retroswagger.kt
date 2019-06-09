@@ -1,8 +1,7 @@
 package com.schibsted.spain.retroswagger.annotation
 
 annotation class Retroswagger(
-    val swaggerUrl: String,
+    val swaggerFilePath: String,
     val apiInterfaceName: String,
-    val customCachePolicyInDays: Int = 0,
-    val overrideInterfaceSlash: Boolean = false
+    val headers: Array<RetroswaggerHeader> = []
 )

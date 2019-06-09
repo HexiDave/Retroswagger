@@ -12,20 +12,20 @@ class PetStorePresenter(private val petStoreService: PetStoreApiInterface) {
     fun init(petStoreView: PetStoreView) {
         view = petStoreView
 
-        val disposable = petStoreService.getPetById(545646671)
-            .subscribeOn(Schedulers.io())
-            .observeOn(AndroidSchedulers.mainThread())
-            .subscribe({
-                pet ->
-                run {
-                    view.onPetFound(pet)
-                }
-            }, {
-                run {
-                    view.onGetPetByIdError()
-                }
-            })
-        compositeDisposable.add(disposable)
+//        val disposable = petStoreService.getPetById(545646671)
+//            .subscribeOn(Schedulers.io())
+//            .observeOn(AndroidSchedulers.mainThread())
+//            .subscribe({
+//                pet ->
+//                run {
+//                    view.onPetFound(pet)
+//                }
+//            }, {
+//                run {
+//                    view.onGetPetByIdError()
+//                }
+//            })
+//        compositeDisposable.add(disposable)
     }
 
 }

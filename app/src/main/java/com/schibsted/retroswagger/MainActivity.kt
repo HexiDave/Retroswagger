@@ -5,21 +5,39 @@ import android.os.Bundle
 import androidx.recyclerview.widget.LinearLayoutManager
 import android.widget.Toast
 import com.schibsted.spain.retroswagger.annotation.Retroswagger
+import com.schibsted.spain.retroswagger.annotation.RetroswaggerHeader
+import com.schibsted.spain.retroswagger.lib.ApiMethodHandler
+import com.squareup.kotlinpoet.AnnotationSpec
+import com.squareup.kotlinpoet.FunSpec
+import io.swagger.models.Operation
 import kotlinx.android.synthetic.main.activity_main.pet_list
 import retrofit2.Retrofit
 import retrofit2.adapter.rxjava2.RxJava2CallAdapterFactory
 import retrofit2.converter.gson.GsonConverterFactory
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.http.Header
 
 
-private const val SERVICE_URL = "http://petstore.swagger.io/v2/"
+private const val SERVICE_URL = "C:\\Dev\\FACI\\Experiment\\swagger.json"
+const val NO_AUTH_HEADER_NAME = "X-No-Auth"
+const val NO_AUTH_HEADER = "$NO_AUTH_HEADER_NAME: X"
 
-@Retroswagger(SERVICE_URL+"swagger.json", "PetStore", 1, true)
+@Retroswagger(
+    SERVICE_URL, "PetStore", [
+        RetroswaggerHeader("Auth_LoginWithOneTimePassword", [NO_AUTH_HEADER]),
+        RetroswaggerHeader("Auth_Refresh", [NO_AUTH_HEADER]),
+        RetroswaggerHeader(
+            "Auth_UpdateFirebaseToken",
+            ["X-Is-Technician: True"]
+        )
+    ]
+)
 class MainActivity : AppCompatActivity(), PetStoreView {
     private val petStorePresenter: PetStorePresenter
 
     private val petStoreService: PetStoreApiInterface
+
     init {
         val interceptor = HttpLoggingInterceptor()
         interceptor.level = HttpLoggingInterceptor.Level.BODY
@@ -28,9 +46,11 @@ class MainActivity : AppCompatActivity(), PetStoreView {
 
         val retrofit = Retrofit.Builder()
             .addCallAdapterFactory(
-                RxJava2CallAdapterFactory.create())
+                RxJava2CallAdapterFactory.create()
+            )
             .addConverterFactory(
-                GsonConverterFactory.create())
+                GsonConverterFactory.create()
+            )
             .baseUrl(SERVICE_URL)
             .client(client)
             .build()
